@@ -160,7 +160,7 @@ function chatSystem(subject) {
 // ============================================================
 
 export default {
-  async fetch(request, env) {
+  async fetch(request, env, ctx) {
     const origin = request.headers.get('Origin') || '';
     const cors = corsHeaders(origin, env);
 
@@ -185,8 +185,9 @@ export default {
       if (url.pathname === '/api/verify') return json({ ok: true }, 200, cors);
 
       const llm = getLLM(tier, env);
-      if (url.pathname === '/api/grade') return json(await grade(body, llm), 200, cors);
-      if (url.pathname === '/api/chat') return json(await chat(body, llm), 200, cors);
+      // 批改和對話可能超過 100 秒，用「邊等邊回報」的方式回應，避免 Cloudflare 524 逾時
+      if (url.pathname === '/api/grade') return streamJSON(() => grade(body, llm), cors, ctx);
+      if (url.pathname === '/api/chat') return streamJSON(() => chat(body, llm), cors, ctx);
 
       return json({ error: 'Not found' }, 404, cors);
     } catch (err) {
@@ -194,6 +195,35 @@ export default {
     }
   },
 };
+
+// 先立刻回應網頁，AI 還在想的時候每 5 秒送一個空白字元保持連線，做完再送出結果
+function streamJSON(work, cors, ctx) {
+  const { readable, writable } = new TransformStream();
+  const writer = writable.getWriter();
+  const enc = new TextEncoder();
+  writer.write(enc.encode(' ')).catch(() => {});
+  const beat = setInterval(() => writer.write(enc.encode(' ')).catch(() => {}), 5000);
+
+  const job = (async () => {
+    let payload;
+    try {
+      payload = await work();
+    } catch (err) {
+      payload = { error: err.message || String(err), status: err.status || 500 };
+    }
+    clearInterval(beat);
+    try {
+      await writer.write(enc.encode(JSON.stringify(payload)));
+      await writer.close();
+    } catch {}
+  })();
+  ctx?.waitUntil?.(job);
+
+  return new Response(readable, {
+    status: 200,
+    headers: { 'Content-Type': 'application/json; charset=utf-8', 'Cache-Control': 'no-store', ...cors },
+  });
+}
 
 // ---------- 批改 ----------
 async function grade(body, llm) {

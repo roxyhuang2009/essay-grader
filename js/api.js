@@ -40,10 +40,13 @@ async function post(path, body, { tier = getTier(), password = getPassword() } =
     throw new Error('連不到後端伺服器，請檢查網路或 Worker 網址');
   }
   let data = {};
-  try { data = await res.json(); } catch {}
-  if (!res.ok) {
-    const err = new Error(data.error || `伺服器錯誤（${res.status}）`);
-    err.status = res.status;
+  try { data = JSON.parse((await res.text()).trim() || '{}'); } catch {}
+  if (!res.ok || data.error) {
+    const status = data.status || res.status;
+    const msg = data.error
+      || (status === 524 ? 'AI 批改太久，連線逾時了，請再試一次（照片少一點會比較快）' : `伺服器錯誤（${status}）`);
+    const err = new Error(msg);
+    err.status = status;
     err.code = data.code;
     throw err;
   }
