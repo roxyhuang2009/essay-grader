@@ -317,8 +317,10 @@ async function callGemini({ apiKey, model, system, messages, json }) {
     role: m.role === 'assistant' ? 'model' : 'user',
     parts: m.parts.map((p) => (p.text != null ? { text: p.text } : { inline_data: { mime_type: p.mime, data: p.data } })),
   }));
+  // 用串流模式（streamGenerateContent）：Gemini 邊想邊回傳，
+  // 連線一直有資料在跑，就不會因為超過 100 秒沒回應而被 Cloudflare 中斷（524）
   const res = await fetch(
-    `https://generativelanguage.googleapis.com/v1beta/models/${encodeURIComponent(model)}:generateContent`,
+    `https://generativelanguage.googleapis.com/v1beta/models/${encodeURIComponent(model)}:streamGenerateContent?alt=sse`,
     {
       method: 'POST',
       headers: { 'Content-Type': 'application/json', 'x-goog-api-key': apiKey },
@@ -329,15 +331,55 @@ async function callGemini({ apiKey, model, system, messages, json }) {
           temperature: json ? 0.3 : 0.7,
           maxOutputTokens: 32768,
           ...(json ? { responseMimeType: 'application/json' } : {}),
+          // 讓「思考過程」也串流回來，思考很久時連線才不會閒置
+          ...(/gemini-(1\.|2\.0)/.test(model) ? {} : { thinkingConfig: { includeThoughts: true } }),
         },
       }),
     }
   );
-  const data = await res.json().catch(() => ({}));
-  if (!res.ok) throw apiError('Gemini', res.status, data?.error?.message);
-  const cand = data?.candidates?.[0];
-  const text = (cand?.content?.parts || []).filter((p) => !p.thought).map((p) => p.text || '').join('');
-  if (!text) throw httpError(502, `AI 沒有回傳內容（${cand?.finishReason || data?.promptFeedback?.blockReason || '未知原因'}）`);
+  if (!res.ok) {
+    const raw = await res.text().catch(() => '');
+    let msg = '';
+    try {
+      const d = JSON.parse(raw);
+      msg = (Array.isArray(d) ? d[0] : d)?.error?.message || '';
+    } catch {}
+    throw apiError('Gemini', res.status, msg || raw.slice(0, 200));
+  }
+
+  // 讀取 SSE 串流：每一行 "data: {...}" 是一小段結果
+  const reader = res.body.getReader();
+  const decoder = new TextDecoder();
+  let buffer = '';
+  let text = '';
+  let finishReason = '';
+  let blockReason = '';
+  const handleLine = (line) => {
+    if (!line.startsWith('data:')) return;
+    const payload = line.slice(5).trim();
+    if (!payload || payload === '[DONE]') return;
+    let chunk;
+    try { chunk = JSON.parse(payload); } catch { return; }
+    if (chunk.error) throw apiError('Gemini', chunk.error.code || 502, chunk.error.message);
+    const cand = chunk.candidates?.[0];
+    for (const p of cand?.content?.parts || []) if (!p.thought && p.text) text += p.text;
+    if (cand?.finishReason) finishReason = cand.finishReason;
+    if (chunk.promptFeedback?.blockReason) blockReason = chunk.promptFeedback.blockReason;
+  };
+  while (true) {
+    const { value, done } = await reader.read();
+    if (done) break;
+    buffer += decoder.decode(value, { stream: true });
+    let i;
+    while ((i = buffer.indexOf('\n')) >= 0) {
+      handleLine(buffer.slice(0, i).trim());
+      buffer = buffer.slice(i + 1);
+    }
+  }
+  handleLine(buffer.trim());
+
+  if (!text) throw httpError(502, `AI 沒有回傳內容（${finishReason || blockReason || '未知原因'}）`);
+  if (finishReason === 'MAX_TOKENS' && json) throw httpError(502, '批改內容太長被截斷了，請再試一次');
   return text;
 }
 
@@ -518,7 +560,15 @@ function httpError(status, message) {
 }
 
 function apiError(name, status, msg) {
-  if (status === 429) return httpError(429, `${name} 使用量達到上限，請稍後再試（免費額度可能用完了）`);
+  if (status === 429) {
+    const free = /free_tier|free tier/i.test(msg || '');
+    return httpError(429, free
+      ? `這組 API key 目前走的是「免費額度」，免費額度已用完或這個模型沒有免費額度。請確認 key 所在的專案有綁定帳單。（Google 原文：${(msg || '').slice(0, 300)}）`
+      : `${name} 使用量達到上限，請等一兩分鐘再試。（Google 原文：${(msg || '').slice(0, 300)}）`);
+  }
   if (status === 401 || status === 403) return httpError(502, `${name} API key 無效或沒有權限，請檢查後端設定`);
+  if (status === 402) return httpError(502, `${name} 額度用完了，請到帳單頁面儲值`);
+  if (status === 404) return httpError(502, `找不到模型，請檢查 Cloudflare 的 MODEL 名稱是否正確（${msg || ''}）`);
+  if (status === 524 || status === 504) return httpError(504, `${name} 回應太久，請再試一次，或把 PAID_MODEL 改成 Flash 模型`);
   return httpError(502, `${name} 錯誤（${status}）：${msg || '未知錯誤'}`);
 }
