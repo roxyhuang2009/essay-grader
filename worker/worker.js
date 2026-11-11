@@ -18,6 +18,9 @@
  *   ALLOWED_ORIGINS  （建議）你的網站網址，例如 https://你的帳號.github.io  （多個用逗號分隔）
  */
 
+// 版本號：打開 Worker 網址會顯示，用來確認 Cloudflare 上跑的是不是最新版
+const VERSION = '2026-11-11 v4（含健康檢查）';
+
 // ============================================================
 // 一、學測評分標準（提示詞）
 // ============================================================
@@ -169,8 +172,9 @@ export default {
     const url = new URL(request.url);
     try {
       if (request.method === 'GET' && url.pathname === '/') {
-        return json({ ok: true, message: '作文批改室後端運作中 ✅' }, 200, cors);
+        return json({ ok: true, message: '作文批改室後端運作中 ✅', version: VERSION }, 200, cors);
       }
+      if (request.method === 'GET' && url.pathname === '/debug') return debug(url, env);
       if (request.method !== 'POST') return json({ error: 'Method not allowed' }, 405, cors);
       if (!isOriginAllowed(origin, env)) return json({ error: '這個網站來源沒有被允許使用（請檢查 ALLOWED_ORIGINS）' }, 403, cors);
 
@@ -195,6 +199,46 @@ export default {
     }
   },
 };
+
+// ---------- 健康檢查：/debug?pw=付費密碼 ----------
+// 顯示目前的設定（key 只顯示最後 4 碼），並用兩組 key 各實際呼叫一次 Gemini，回報 Google 的原始結果
+async function debug(url, env) {
+  const out = (data, status = 200) =>
+    new Response(JSON.stringify(data, null, 2), { status, headers: { 'Content-Type': 'application/json; charset=utf-8' } });
+  if (!checkPassword(encodeURIComponent(url.searchParams.get('pw') || ''), env)) {
+    return out({ error: '請在網址後面加上 ?pw=你的付費密碼' }, 401);
+  }
+  const tail = (k) => (k ? `…${String(k).trim().slice(-4)}（長度 ${String(k).length}${/\s/.test(k) ? '，⚠️ 含有空白或換行！' : ''}）` : '❌ 未設定');
+  const report = { version: VERSION, settings: {}, tests: {} };
+  for (const P of ['FREE', 'PAID']) {
+    const provider = (env[`${P}_PROVIDER`] || 'gemini').toLowerCase();
+    const model = env[`${P}_MODEL`] || (provider === 'gemini' ? 'gemini-flash-latest' : '(未設定)');
+    report.settings[P] = { provider, model, key: tail(env[`${P}_API_KEY`]) };
+    if (provider !== 'gemini' || !env[`${P}_API_KEY`]) continue;
+    const t0 = Date.now();
+    try {
+      const res = await fetch(
+        `https://generativelanguage.googleapis.com/v1beta/models/${encodeURIComponent(model)}:generateContent`,
+        {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json', 'x-goog-api-key': String(env[`${P}_API_KEY`]).trim() },
+          body: JSON.stringify({ contents: [{ role: 'user', parts: [{ text: '只回覆兩個字：正常' }] }] }),
+        }
+      );
+      const raw = await res.text();
+      let d = {};
+      try { d = JSON.parse(raw); } catch {}
+      report.tests[P] = res.ok
+        ? { 結果: '✅ 成功', 秒數: (Date.now() - t0) / 1000, 回覆: (d.candidates?.[0]?.content?.parts || []).map((p) => p.text || '').join('').slice(0, 50) }
+        : { 結果: `❌ 失敗（HTTP ${res.status}）`, Google原文: d.error?.message || raw.slice(0, 800), 狀態: d.error?.status, 詳細: d.error?.details };
+    } catch (e) {
+      report.tests[P] = { 結果: '❌ 連不到 Google', 錯誤: String(e) };
+    }
+  }
+  report.settings.PAID_PASSWORDS = `已設定 ${String(env.PAID_PASSWORDS || '').split(',').filter((s) => s.trim()).length} 組`;
+  report.settings.ALLOWED_ORIGINS = env.ALLOWED_ORIGINS || '（未設定，目前所有網站都能用）';
+  return out(report);
+}
 
 // 先立刻回應網頁，AI 還在想的時候每 5 秒送一個空白字元保持連線，做完再送出結果
 function streamJSON(work, cors, ctx) {
@@ -299,7 +343,7 @@ async function chat(body, llm) {
 function getLLM(tier, env) {
   const P = tier === 'paid' ? 'PAID' : 'FREE';
   const provider = (env[`${P}_PROVIDER`] || 'gemini').toLowerCase().trim();
-  const apiKey = env[`${P}_API_KEY`];
+  const apiKey = String(env[`${P}_API_KEY`] || '').trim(); // 去掉貼上時多出來的空白、換行
   if (!apiKey) throw httpError(500, `後端尚未設定 ${P}_API_KEY`);
 
   const defaults = { gemini: 'gemini-flash-latest', anthropic: 'claude-sonnet-5-5' };
